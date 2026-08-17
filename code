@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Итоговый скрипт классификации обращений из почты Yandex.
+Группы: Оргтехника, РМИС, Электронная подпись, Компьютеры, Программы, Прочее.
+Период: 01.01.2026 – 30.06.2026.
+Отправитель: 6729b6e95056908ed3f2927f@forms.yandex.com.
+"""
+
+import imaplib
+import email
+from email.header import decode_header
+from email.utils import parsedate_to_datetime, parseaddr
+import re
+import getpass
+from datetime import datetime, timedelta
+import csv
+import os
+
+# --------------------------- Стемминг (опционально) ---------------------------
+try:
+    from nltk.stem.snowball import SnowballStemmer
+    stemmer = SnowballStemmer("russian")
+    HAS_STEMMER = True
+except ImportError:
+    HAS_STEMMER = False
+    print("⚠️ nltk не установлен – стемминг отключён. Для улучшения качества установите: pip install nltk")
+    print("   Затем загрузите стоп-слова: python -m nltk.downloader stopwords")
+
+def stem(word):
+    """Возвращает стем слова, если стеммер доступен, иначе само слово."""
+    if HAS_STEMMER:
+        return stemmer.stem(word.lower())
+    return word.lower()
+
+# --------------------------- Конфигурация ---------------------------
+IMAP_SERVER = "imap.yandex.ru"
+IMAP_PORT = 993
+USERNAME = "gb1-kostroma-it@yandex.ru"
+PASSWORD = getpass.getpass("Введите пароль приложения для Yandex: ")
+
+DATE_START = datetime(2026, 1, 1)
+DATE_END   = datetime(2026, 6, 30)
+
+START_PHRASES = [
+    "Текст обращения:",
+    "Вызов:",
+    "Описание проблемы:"
+]
+STOP_PHRASE = ("Это письмо содержит ответы на опрос, созданный "
+               "пользователем Yandex Forms. Яндекс не несёт "
+               "ответственности за содержание письма.")
+
+ALLOWED_SENDER = "6729b6e95056908ed3f2927f@forms.yandex.com"
+
+# --------------------------- Имена для удаления ---------------------------
+NAMES_TO_REMOVE = {'иван', 'сергей', 'сергеевич', 'егор', 'антон'}
+
+# --------------------------- Словари ключевых слов (стемы) ---------------------------
+# Оргтехника
+OFFICE_EQUIPMENT = {stem(w) for w in [
+    "принтер", "принтеры", "мфу", "копир", "сканер", "сканеры", "скан", "сканирует",
+    "печать", "печати", "печатью", "печатей", "печатям", "печатями", "печатях",
+    "печатать", "печатает", "печатал", "печатали", "печатаю", "печатаем",
+    "распечатка", "распечатки", "распечатку", "распечаткой",
+    "распечатать", "распечатывать", "распечатал", "распечатали",
+    "картридж", "картриджи", "тонер", "тонеры", "бумага",
+    "замятие", "замятия", "замял", "зажевал", "не печатает",
+    "не копирует", "не сканирует", "нет подачи", "не захватывает",
+    "нет краски", "нет тонера", "заправка", "заправить"
+]}
+
+# РМИС – точные аббревиатуры
+RMIS_WORDS = {"рмис", "мис", "rmis", "ermis", "эрмис"}
+
+# Электронная подпись
+EDS_KEYWORDS = {stem(w) for w in [
+    "эцп", "электронная подпись", "электронной подписи",
+    "сертификат", "сертификаты", "криптопро", "cryptopro",
+    "токен", "токены", "рутокен", "rutoken", "подпись",
+    "подписывать", "подписать", "эцп-ключ", "закрытый ключ",
+    "открытый ключ"
+]}
+
+# Компьютеры (железо, включение, сеть)
+COMPUTER_KEYWORDS = {stem(w) for w in [
+    "компьютер", "компьютеры", "пк", "ноутбук", "ноутбуки",
+    "системный блок", "системник", "моноблок", "моноблоки",
+    "монитор", "мониторы", "экран", "экраны", "клавиатура",
+    "клавиатуры", "мышь", "мыши", "включение", "включается",
+    "не включается", "загрузка", "загружается", "не загружается",
+    "перезагрузка", "перезагрузить", "интернет", "сеть",
+    "подключение", "подключить", "wi-fi", "вайфай", "роутер",
+    "маршрутизатор", "кабель", "сетевой", "нет сети",
+    "нет интернета", "не открываются страницы", "браузер",
+    "система", "windows", "виндовс", "зависает", "зависание"
+]}
+
+# Программы (софт, 1С, офис, ошибки приложений)
+SOFTWARE_KEYWORDS = {stem(w) for w in [
+    "программа", "программы", "софт", "приложение", "приложения",
+    "1с", "1c", "бухгалтерия", "excel", "word", "офис",
+    "браузер", "ошибка", "ошибки", "сбой", "не запускается",
+    "не работает", "установка", "установить", "обновление",
+    "обновить", "лицензия", "активация", "ключ", "база",
+    "база данных", "sql", "сервер", "не открывается",
+    "вылетает", "закрывается", "патч", "конфигурация",
+    "конфигуратор"
+]}
+
+# --------------------------- Вспомогательные функции ---------------------------
+def clean_text(text: str) -> str:
+    """Убираем лишние пробелы и переводы строк."""
+    return re.sub(r'\s+', ' ', text).strip()
+
+def remove_names(text: str) -> str:
+    """Удаляем заданные имена из текста (заменяем на пробел)."""
+    pattern = r'\b(' + '|'.join(re.escape(name) for name in NAMES_TO_REMOVE) + r')\b'
+    return re.sub(pattern, ' ', text, flags=re.IGNORECASE)
+
+def get_email_body(msg: email.message.Message) -> str:
+    """Извлекаем тело письма (предпочитаем plain text)."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
+            if content_type == "text/plain" and "attachment" not in content_disposition:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    return payload.decode(charset, errors='replace')
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or 'utf-8'
+                    text = re.sub(r'<[^>]+>', '', payload.decode(charset, errors='replace'))
+                    return clean_text(text)
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or 'utf-8'
+            return payload.decode(charset, errors='replace')
+    return ""
+
+def extract_relevant_text(body: str) -> str:
+    """Извлекаем текст между стартовой фразой (первая непустая) и стоп-фразой."""
+    text = None
+    for phrase in START_PHRASES:
+        idx = body.find(phrase)
+        if idx != -1:
+            after = body[idx + len(phrase):].strip()
+            if after:
+                text = after
+                break
+    if text is None:
+        return ""
+    stop_idx = text.find(STOP_PHRASE)
+    if stop_idx != -1:
+        text = text[:stop_idx].strip()
+    return clean_text(text)
+
+def fetch_emails():
+    """Загружаем письма за период от заданного отправителя."""
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    mail._encoding = 'utf-8'
+    mail.login(USERNAME, PASSWORD)
+    mail.select("INBOX")
+
+    since = DATE_START.strftime("%d-%b-%Y")
+    before = (DATE_END + timedelta(days=1)).strftime("%d-%b-%Y")
+    search_criteria = f'(SINCE {since} BEFORE {before})'
+
+    status, message_ids = mail.search(None, search_criteria)
+    if status != 'OK':
+        raise RuntimeError(f"Ошибка поиска писем: {status}")
+
+    ids = message_ids[0].split()
+    emails_data = []
+    for num in ids:
+        status, msg_data = mail.fetch(num, '(RFC822)')
+        if status != 'OK':
+            continue
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        # Проверка отправителя
+        from_field = msg.get('From', '')
+        real_name, from_addr = parseaddr(from_field)
+        if from_addr.lower() != ALLOWED_SENDER.lower():
+            continue
+
+        # Проверка даты
+        date_str = msg.get('Date')
+        if date_str:
+            try:
+                email_date = parsedate_to_datetime(date_str)
+                email_date = email_date.replace(tzinfo=None)
+                if email_date < DATE_START or email_date > DATE_END + timedelta(days=1):
+                    continue
+            except Exception:
+                pass
+
+        body = get_email_body(msg)
+        if not body:
+            continue
+        # Удаляем имена перед извлечением текста
+        body_clean = remove_names(body)
+        relevant = extract_relevant_text(body_clean)
+        if relevant and len(relevant) >= 3:
+            emails_data.append(relevant)
+    mail.logout()
+    return emails_data
+
+# --------------------------- Классификация ---------------------------
+def classify_text(text: str) -> str:
+    """Возвращает название группы на основе ключевых слов."""
+    lower = text.lower()
+    tokens = re.findall(r'[а-яёa-z]+', lower)
+
+    # 1. Проверяем РМИС (точные совпадения аббревиатур) – в первую очередь
+    for token in tokens:
+        if token in RMIS_WORDS:
+            return "РМИС"
+
+    # Стеммируем все токены
+    stems = {stem(t) for t in tokens}
+
+    # 2. Оргтехника
+    if stems & OFFICE_EQUIPMENT:
+        return "Оргтехника"
+
+    # 3. Электронная подпись
+    if stems & EDS_KEYWORDS:
+        return "Электронная подпись"
+
+    # 4. Компьютеры
+    if stems & COMPUTER_KEYWORDS:
+        return "Компьютеры"
+
+    # 5. Программы
+    if stems & SOFTWARE_KEYWORDS:
+        return "Программы"
+
+    return "Прочее"
+
+# --------------------------- Главная ---------------------------
+def main():
+    print("Подключение к почтовому ящику...")
+    texts = fetch_emails()
+    total = len(texts)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(script_dir, "result.csv")
+    txt_path = os.path.join(script_dir, "detailed_analysis.txt")
+
+    if total == 0:
+        print("❌ Писем от заданного отправителя за период не найдено.")
+        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(['Группа', 'Количество писем', 'Процент'])
+        print(f"Создан пустой {csv_path}")
+        return
+
+    print(f"Найдено писем для анализа: {total}")
+
+    # Классификация каждого письма
+    groups = {
+        "Оргтехника": [],
+        "РМИС": [],
+        "Электронная подпись": [],
+        "Компьютеры": [],
+        "Программы": [],
+        "Прочее": []
+    }
+
+    for t in texts:
+        category = classify_text(t)
+        groups[category].append(t)
+
+    # Сортируем группы по убыванию количества
+    sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]), reverse=True)
+
+    # ---------- Вывод на экран ----------
+    header = f"{'Группа':<25} {'Кол-во':<8} {'%':<6}"
+    print("\n" + header)
+    print("-" * len(header))
+    for name, items in sorted_groups:
+        cnt = len(items)
+        pct = cnt / total * 100
+        print(f"{name:<25} {cnt:<8} {pct:<6.1f}")
+
+    # ---------- CSV (разделитель ;) ----------
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f, delimiter=';')
+        writer.writerow(['Группа', 'Количество писем', 'Процент'])
+        for name, items in sorted_groups:
+            cnt = len(items)
+            pct = cnt / total * 100
+            writer.writerow([name, cnt, f"{pct:.1f}"])
+    print(f"✅ CSV сохранён: {csv_path}")
+
+    # ---------- Подробный отчёт (до 5 примеров) ----------
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write("=== ДЕТАЛЬНЫЙ АНАЛИЗ ОБРАЩЕНИЙ ПО ГРУППАМ ===\n")
+        f.write(f"Всего писем: {total}\n\n")
+        for name, items in sorted_groups:
+            cnt = len(items)
+            pct = cnt / total * 100
+            f.write(f"--- {name} ---\n")
+            f.write(f"Количество: {cnt} ({pct:.1f}%)\n\n")
+            if items:
+                f.write("Примеры обращений (до 150 символов):\n")
+                for i, ex in enumerate(items[:5], 1):
+                    short = ex[:150] + '...' if len(ex) > 150 else ex
+                    f.write(f"  {i}. {short}\n")
+            else:
+                f.write("  Нет обращений\n")
+            f.write("\n" + "="*50 + "\n\n")
+    print(f"✅ Подробный отчёт сохранён: {txt_path}")
+
+if __name__ == "__main__":
+    main()
